@@ -1,14 +1,16 @@
 """Тесты валидатора. Офлайн: работают на сохранённом каталоге, сеть не нужна.
 
-Каждый случай из группы «сервер это принимает» проверен на живом API 28.07.2026:
-смета вернула valid: true и деньги списались бы. Валидатор ловит их до отправки.
+В первой группе четыре случая проверены на живом API 28.07.2026: смета вернула
+valid: true, то есть запрос ушёл бы в оплату. Ещё два (длина промпта, число
+элементов списка) проверены только против каталога, живьём не гонялись.
 
 Запуск: python test_vibecheck.py  (или pytest test_vibecheck.py)
 """
 import json
 import pathlib
 
-from vibecheck import audit_catalog_vs_prices, build_rules, validate
+from vibecheck import (LIST_PARAMS, audit_catalog_vs_prices, build_rules,
+                       price_hint, validate)
 
 FIX = pathlib.Path(__file__).parent / "fixtures"
 CATALOG = json.load(open(FIX / "capabilities.json", encoding="utf-8"))
@@ -29,7 +31,7 @@ def test_enum_violation_server_accepts_this():
 
 
 def test_range_violation_server_accepts_this():
-    """seedance-2: каталог объявляет duration 4-15s. Смета приняла 30 — общий предел 60."""
+    """seedance-2: каталог объявляет duration 4-15s. Смета приняла 30, общий предел 60."""
     assert "range_violation" in codes(
         {"type": "video", "model": "seedance-2", "prompt": "тест", "duration": 30})
 
@@ -43,7 +45,7 @@ def test_mutually_exclusive_server_accepts_this():
 
 
 def test_type_mismatch_server_accepts_this():
-    """gemini-omni-character: каталог относит к image, прайс — к text.
+    """gemini-omni-character: каталог относит к image, прайс к text.
     Смета принимает оба варианта, то есть поле type ни с чем не сверяется."""
     assert "type_mismatch" in codes(
         {"type": "text", "model": "gemini-omni-character", "prompt": "кот",
@@ -51,18 +53,19 @@ def test_type_mismatch_server_accepts_this():
 
 
 def test_too_many_items():
-    """reference_image_urls: каталог задаёт максимум 9."""
+    """reference_image_urls: каталог задаёт максимум 9. Живьём не проверялось."""
     body = {"type": "video", "model": "seedance-2", "prompt": "тест",
             "reference_image_urls": [f"https://x/{i}.png" for i in range(12)]}
     assert "too_many" in codes(body)
 
 
 def test_prompt_too_long():
+    """Каталог задаёт prompt_max. Живьём не проверялось."""
     assert "too_long" in codes(
         {"type": "image", "model": "z-image", "prompt": "а" * 20001})
 
 
-# --- то, что сервер и так ловит, — валидатор должен ловить тоже -------------
+# --- то, что сервер и так ловит: валидатор должен ловить тоже --------------
 
 def test_unknown_param():
     assert "unknown_param" in codes(
@@ -75,7 +78,7 @@ def test_required_missing():
 
 
 def test_unknown_model_from_price_list():
-    """grok-ttv-10 есть в /prices, но в каталоге его нет — параметры взять неоткуда."""
+    """grok-ttv-10 есть в /prices, но в каталоге его нет: параметры взять неоткуда."""
     problems = validate({"type": "video", "model": "grok-ttv-10", "prompt": "тест"}, RULES)
     assert problems[0].code == "unknown_model"
     assert "grok-ttv" in problems[0].message  # подсказывает существующее имя
@@ -104,14 +107,26 @@ def test_every_catalog_model_accepts_its_own_minimal_request():
     """Ни одна модель не должна ругаться на запрос из своих же обязательных полей."""
     for name, r in RULES.items():
         body = {"type": r.type, "model": name}
-        body.update({f: "https://x/a.png" for f in r.required if f != "prompt"})
-        if "prompt" in r.required:
-            body["prompt"] = "тест"
-        assert [p for p in validate(body, RULES)
-                if p.code not in ("wrong_shape",)] == [], f"ложное срабатывание на {name}"
+        for f in r.required:
+            if f == "prompt":
+                body[f] = "тест"
+            else:
+                body[f] = ["https://x/a.png"] if f in LIST_PARAMS else "https://x/a.png"
+        assert validate(body, RULES) == [], f"ложное срабатывание на {name}"
 
 
 # --- сверка публичных описаний ---------------------------------------------
+
+def test_price_hint_does_not_pretend_to_know_variable_price():
+    """У grok-ttv, seedream-5-pro и motion-control цена зависит от параметров.
+    Каталог это помечает, валидатор не должен выдавать базовую цену за итоговую."""
+    for model, typ in (("grok-ttv", "video"), ("seedream-5-pro", "image"),
+                       ("motion-control-720p", "video")):
+        hint = price_hint({"model": model, "type": typ}, RULES)
+        assert "зависит от параметров" in hint, model
+        assert "estimate" in hint, model
+    assert price_hint({"model": "z-image", "type": "image"}, RULES) == "ориентировочно 1.2 ₽"
+
 
 def test_audit_finds_known_discrepancies():
     problems = audit_catalog_vs_prices(CATALOG, PRICES)

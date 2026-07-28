@@ -1,11 +1,12 @@
-"""vibecheck — проверка запросов к Agent API «Вайб-Маркетолог» по их же каталогу.
+"""vibecheck: проверка запросов к Agent API «Вайб-Маркетолог» по их же каталогу.
 
 Две команды:
-  validate  — проверить тело запроса ДО отправки, по правилам из GET /capabilities
-  audit     — сверить три публичных описания между собой: каталог, прайс и смету
+  validate  проверить тело запроса до отправки, по правилам из GET /capabilities
+  audit     сверить каталог с прайсом (без токена); опционально со сметой (нужен токен)
 
 Валидатор не знает ни одной модели: все правила берутся из каталога, который
-платформа отдаёт наружу. Новая модель в каталоге — новые правила без правки кода.
+платформа отдаёт наружу. Новая модель в каталоге даёт новые правила без правки кода.
+Исключение: имена полей-списков перечислены ниже в LIST_PARAMS.
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ except ImportError:  # ponytail: без truststore тоже поедет, есл
 
 BASE = os.environ.get("VIBE_API_BASE", "https://lk.vibemarketolog.ru/api/agent")
 
-# поля, которые принимает любая модель — в каталоге они не перечислены
+# поля, которые принимает любая модель: в каталоге они не перечислены
 COMMON_PARAMS = {"type", "model", "prompt", "callback_url", "strict", "idempotency_key"}
 
 # поля-списки: каталог задаёт для них максимум элементов, а не максимум значения
@@ -79,6 +80,7 @@ class ModelRules:
     name: str
     type: str
     price: float | None = None
+    price_varies: str | None = None   # tier_prices / price_by_quality / price_formula
     required: set[str] = field(default_factory=set)
     allowed: set[str] = field(default_factory=set)
     enums: dict[str, list] = field(default_factory=dict)
@@ -93,11 +95,11 @@ _RANGE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*([a-zа-я]*)\
 
 
 def _parse_limits(spec: dict, rules: ModelRules) -> None:
-    """limits в каталоге записаны тремя способами — разбираем каждый по-своему."""
+    """limits в каталоге записаны тремя способами, разбираем каждый по-своему."""
     for key, val in spec.get("limits", {}).items():
         if key == "mutually_exclusive":
             # группы = взаимоисключающие сценарии: внутри группы поля совместимы
-            # (first_frame_url + last_frame_url), между группами — нет.
+            # (first_frame_url + last_frame_url), между группами нет.
             # Семантика выведена из hint модели: документация её не описывает.
             rules.exclusive = [list(g) for g in val]
         elif key.endswith("_max") and isinstance(val, (int, float)):
@@ -114,8 +116,10 @@ def build_rules(catalog: dict) -> dict[str, ModelRules]:
     out: dict[str, ModelRules] = {}
     for typ, models in catalog.get("models", {}).items():
         for name, spec in models.items():
+            varies = next((k for k in ("tier_prices", "price_by_quality", "price_formula")
+                           if k in spec), None)
             r = ModelRules(name=name, type=typ, price=spec.get("price"),
-                           hint=spec.get("hint"))
+                           price_varies=varies, hint=spec.get("hint"))
             r.required = set(spec.get("required", []))
             r.allowed = COMMON_PARAMS | r.required | set(spec.get("optional", []))
             r.enums = dict(spec.get("enums", {}))
@@ -159,7 +163,7 @@ def validate(body: dict, rules: dict[str, ModelRules]) -> list[Problem]:
             lo, hi = rng
             if not lo <= value <= hi:
                 problems.append(Problem("range_violation", name,
-                                        f"{value} вне диапазона {lo:g}–{hi:g}"))
+                                        f"{value} вне диапазона {lo:g}-{hi:g}"))
         if (cap := r.max_len.get(name)) and isinstance(value, str) and len(value) > cap:
             problems.append(Problem("too_long", name, f"{len(value)} символов при пределе {cap}"))
         if (cap := r.max_items.get(name)) and isinstance(value, list) and len(value) > cap:
@@ -172,7 +176,7 @@ def validate(body: dict, rules: dict[str, ModelRules]) -> list[Problem]:
     if len(engaged) > 1:
         names = " и ".join("/".join(present) for _, present in engaged)
         problems.append(Problem("mutually_exclusive", names,
-                                "это разные сценарии — в одном запросе можно использовать только один"))
+                                "это разные сценарии: в одном запросе допустим только один"))
     return problems
 
 
@@ -181,9 +185,15 @@ def _similar(name: str, rules: dict) -> list[str]:
     return [m for m in rules if m.startswith(stem)][:3] or list(rules)[:3]
 
 
-def estimated_cost(body: dict, rules: dict[str, ModelRules]) -> float | None:
+def price_hint(body: dict, rules: dict[str, ModelRules]) -> str:
+    """Цена по каталогу. Для моделей с переменной ценой каталог сам велит идти в смету."""
     r = rules.get(body.get("model", ""))
-    return r.price if r else None
+    if r is None:
+        return ""
+    if r.price_varies:
+        return (f"цена зависит от параметров (в каталоге {r.price_varies}); "
+                f"точную даёт POST /generate/estimate")
+    return f"ориентировочно {r.price} ₽" if r.price is not None else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -191,21 +201,24 @@ def estimated_cost(body: dict, rules: dict[str, ModelRules]) -> float | None:
 # --------------------------------------------------------------------------- #
 
 def audit_catalog_vs_prices(catalog: dict, prices: dict) -> list[Problem]:
-    """Каталог и прайс — два публичных источника правды. Сверяем состав и типы."""
+    """Каталог и прайс: два публичных источника правды. Сверяем состав и типы."""
     problems = []
     cat = {m: t for t, ms in catalog.get("models", {}).items() for m in ms}
     pri = {m: t for t, ms in prices.get("prices", {}).items() for m in ms}
 
+    specs = {m: s for ms in catalog.get("models", {}).values() for m, s in ms.items()}
     for m in sorted(set(cat) - set(pri)):
+        how = ("формулой price_formula" if "price_formula" in specs[m]
+               else f"{specs[m].get('price')} ₽")
         problems.append(Problem("price_missing", m,
-                                "есть в каталоге, цены в /prices нет — бюджет посчитать нельзя"))
+                                f"в каталоге цена есть ({how}), в /prices модели нет"))
     for m in sorted(set(pri) - set(cat)):
         problems.append(Problem("catalog_missing", m,
-                                "есть в /prices, в каталоге нет — параметры узнать неоткуда"))
+                                "есть в /prices, в каталоге нет: параметры узнать неоткуда"))
     for m in sorted(set(cat) & set(pri)):
         if cat[m] != pri[m]:
             problems.append(Problem("type_conflict", m,
-                                    f"каталог: {cat[m]}, прайс: {pri[m]} — какой слать в поле type?"))
+                                    f"каталог: {cat[m]}, прайс: {pri[m]}; какой слать в поле type?"))
     for m, spec in ((m, s) for ms in catalog.get("models", {}).values() for m, s in ms.items()):
         if m in pri and (p := spec.get("price")) is not None:
             listed = prices["prices"][pri[m]][m]
@@ -240,7 +253,7 @@ def audit_against_estimate(rules: dict[str, ModelRules], token: str,
             problems.append(Problem("param_phantom", name,
                                     f"каталог публикует, смета не принимает: {', '.join(sorted(missing))}"))
         cost = resp.get("estimated_cost_rub")
-        if cost is not None and r.price is not None and cost != r.price:
+        if cost is not None and r.price is not None and cost != r.price and not r.price_varies:
             problems.append(Problem("price_drift", name,
                                     f"каталог: {r.price} ₽, смета: {cost} ₽"))
     return problems
@@ -263,7 +276,7 @@ def _token() -> str:
             if line.startswith("SPA_ACCESS_TOKEN="):
                 tok = line.split("=", 1)[1].strip()
     if not tok:
-        sys.exit("нужен SPA_ACCESS_TOKEN — в окружении или в .env")
+        sys.exit("нужен SPA_ACCESS_TOKEN: в окружении или в .env")
     return tok
 
 
@@ -278,10 +291,10 @@ def main(argv: list[str]) -> int:
         rules = build_rules(load_catalog(os.environ.get("VIBE_CATALOG")))
         problems = validate(body, rules)
         if not problems:
-            cost = estimated_cost(body, rules)
-            print(f"замечаний нет; ориентировочно {cost} ₽" if cost else "замечаний нет")
+            hint = price_hint(body, rules)
+            print(f"замечаний нет; {hint}" if hint else "замечаний нет")
             return 0
-        print(f"замечаний: {len(problems)} — запрос отправлять нельзя")
+        print(f"замечаний: {len(problems)}, запрос отправлять нельзя")
         for p in problems:
             print(" ", p)
         return 1
