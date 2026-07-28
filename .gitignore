@@ -7,3 +7,4 @@ out/
 # внутренние рабочие материалы — не для показа заказчику
 docs/fpf-razbor.md
 docs/vibemarketolog-obzor.md
+.claude/
